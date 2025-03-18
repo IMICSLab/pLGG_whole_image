@@ -1,0 +1,434 @@
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
+
+from blocks import *
+
+class MedNeXt(nn.Module):
+
+    def __init__(self, 
+        in_channels: int, 
+        n_channels: int,
+        n_classes: int, 
+        exp_r: int = 4,                            # Expansion ratio as in Swin Transformers
+        kernel_size: int = 7,                      # Ofcourse can test kernel_size
+        enc_kernel_size: int = None,
+        dec_kernel_size: int = None,
+        deep_supervision: bool = False,             # Can be used to test deep supervision
+        do_res: bool = False,                       # Can be used to individually test residual connection
+        do_res_up_down: bool = False,             # Additional 'res' connection on up and down convs
+        checkpoint_style: bool = None,            # Either inside block or outside block
+        block_counts: list = [2,2,2,2,2,2,2,2,2], # Can be used to test staging ratio: 
+                                            # [3,3,9,3] in Swin as opposed to [2,2,2,2,2] in nnUNet
+        norm_type = 'group',
+        dim = '3d',                                # 2d or 3d
+        grn = False,
+        reg = True,
+        seg = True,
+        fc_dropout_rate = 0,
+        conv_dropout_rate = 0,
+        global_drop_path_rate = 0.0,
+        local_drop_path_rate = 0.0,
+        reg_num_outputs = 0.0,
+        brats = False
+    ):
+
+        super().__init__()
+
+        self.global_drop_path = DropPath(global_drop_path_rate) if global_drop_path_rate > 0. else nn.Identity()
+        self.fc_activation = nn.LeakyReLU()
+        self.seg = seg
+        self.reg = reg
+        self.do_ds = deep_supervision
+        self.brats = brats
+        assert checkpoint_style in [None, 'outside_block']
+        self.inside_block_checkpointing = False
+        self.outside_block_checkpointing = False
+        if checkpoint_style == 'outside_block':
+            self.outside_block_checkpointing = True
+        assert dim in ['2d', '3d']
+        
+        if kernel_size is not None:
+            enc_kernel_size = kernel_size
+            dec_kernel_size = kernel_size
+
+        if dim == '2d':
+            conv = nn.Conv2d
+        elif dim == '3d':
+            conv = nn.Conv3d
+            
+        self.stem = conv(in_channels, n_channels, kernel_size=1)
+        if type(exp_r) == int:
+            exp_r = [exp_r for i in range(len(block_counts))]
+        
+        self.enc_block_0 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels,
+                out_channels=n_channels,
+                exp_r=exp_r[0],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate = local_drop_path_rate
+                ) 
+            for i in range(block_counts[0])]
+        ) 
+
+        self.down_0 = MedNeXtDownBlock(
+            in_channels=n_channels,
+            out_channels=2*n_channels,
+            exp_r=exp_r[1],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim
+        )
+    
+        self.enc_block_1 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*2,
+                out_channels=n_channels*2,
+                exp_r=exp_r[1],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[1])]
+        )
+
+        self.down_1 = MedNeXtDownBlock(
+            in_channels=2*n_channels,
+            out_channels=4*n_channels,
+            exp_r=exp_r[2],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.enc_block_2 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*4,
+                out_channels=n_channels*4,
+                exp_r=exp_r[2],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[2])]
+        )
+
+        self.down_2 = MedNeXtDownBlock(
+            in_channels=4*n_channels,
+            out_channels=8*n_channels,
+            exp_r=exp_r[3],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+        
+        self.enc_block_3 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*8,
+                out_channels=n_channels*8,
+                exp_r=exp_r[3],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )            
+            for i in range(block_counts[3])]
+        )
+        
+        self.down_3 = MedNeXtDownBlock(
+            in_channels=8*n_channels,
+            out_channels=16*n_channels,
+            exp_r=exp_r[4],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.bottleneck = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*16,
+                out_channels=n_channels*16,
+                exp_r=exp_r[4],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[4])]
+        )
+
+        self.down_4 = MedNeXtDownBlock(
+            in_channels=16*n_channels,
+            out_channels=4*n_channels,
+            exp_r=exp_r[4],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.up_3 = MedNeXtUpBlock(
+            in_channels=16*n_channels,
+            out_channels=8*n_channels,
+            exp_r=exp_r[5],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.dec_block_3 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*8,
+                out_channels=n_channels*8,
+                exp_r=exp_r[5],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[5])]
+        )
+
+        self.up_2 = MedNeXtUpBlock(
+            in_channels=8*n_channels,
+            out_channels=4*n_channels,
+            exp_r=exp_r[6],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.dec_block_2 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*4,
+                out_channels=n_channels*4,
+                exp_r=exp_r[6],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[6])]
+        )
+
+        self.up_1 = MedNeXtUpBlock(
+            in_channels=4*n_channels,
+            out_channels=2*n_channels,
+            exp_r=exp_r[7],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.dec_block_1 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels*2,
+                out_channels=n_channels*2,
+                exp_r=exp_r[7],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[7])]
+        )
+
+        self.up_0 = MedNeXtUpBlock(
+            in_channels=2*n_channels,
+            out_channels=n_channels,
+            exp_r=exp_r[8],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
+        )
+
+        self.dec_block_0 = nn.Sequential(*[
+            MedNeXtBlock(
+                in_channels=n_channels,
+                out_channels=n_channels,
+                exp_r=exp_r[8],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn,
+                local_drop_path_rate=local_drop_path_rate
+                )
+            for i in range(block_counts[8])]
+        )
+
+        self.out_0 = OutBlock(in_channels=n_channels, n_classes=n_classes, dim=dim)
+
+        # Used to fix PyTorch checkpointing bug
+        self.dummy_tensor = nn.Parameter(torch.tensor([1.]), requires_grad=True)  
+
+        if deep_supervision:
+            self.out_1 = OutBlock(in_channels=n_channels*2, n_classes=n_classes, dim=dim)
+            self.out_2 = OutBlock(in_channels=n_channels*4, n_classes=n_classes, dim=dim)
+            self.out_3 = OutBlock(in_channels=n_channels*8, n_classes=n_classes, dim=dim)
+            self.out_4 = OutBlock(in_channels=n_channels*16, n_classes=n_classes, dim=dim)
+
+        self.block_counts = block_counts
+
+        self.upsample = torch.nn.Upsample(size=(240,240,155))
+
+
+        self.fc1 = torch.nn.Linear(int(2048 * n_channels/8), 512)
+        # self.bnfc1 = nn.BatchNorm1d(64)
+        self.instancenorm = nn.InstanceNorm1d(512)
+        if self.brats:
+            self.fc2 = torch.nn.Linear(512, 1)
+        else:
+            self.fc2 = torch.nn.Linear(512, 3)
+        self.fc2_pretrain = torch.nn.Linear(512, int(reg_num_outputs)+1)
+        # self.fcloc = torch.nn.Linear(64, 1)
+        # self.fcreg = torch.nn.Linear(64, int(reg_num_outputs))
+        self.sigmoid = torch.nn.Sigmoid()
+        nn.init.kaiming_normal_(self.fc1.weight)
+        nn.init.kaiming_normal_(self.fc2.weight)
+        nn.init.kaiming_normal_(self.fc2_pretrain.weight)
+        # nn.init.kaiming_normal_(self.fcreg.weight)
+
+        self.fc_dropout = nn.Dropout(fc_dropout_rate)
+        self.conv_dropout = nn.Dropout3d(conv_dropout_rate)
+
+    def iterative_checkpoint(self, sequential_block, x):
+        """
+        This simply forwards x through each block of the sequential_block while
+        using gradient_checkpointing. This implementation is designed to bypass
+        the following issue in PyTorch's gradient checkpointing:
+        https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/9
+        """
+        for l in sequential_block:
+            x = checkpoint.checkpoint(l, x, self.dummy_tensor)
+        return x
+
+
+    def forward(self, x):
+        x = torch.nn.functional.interpolate(x, size=(128,128,128))
+        x = self.stem(x)
+
+        # print(x.size())
+        # x = self.conv_dropout(x)
+        x_res_0 = self.enc_block_0(x)
+        # print(x.size())
+        x = self.down_0(x_res_0)
+        # print(x.size())
+        x = self.conv_dropout(x)
+        x_res_1 = self.enc_block_1(x)
+        # print(x.size())
+        x = self.down_1(x_res_1)
+        # print(x.size())
+        x = self.conv_dropout(x)
+        x_res_2 = self.enc_block_2(x)
+        # print(x.size())
+        x = self.down_2(x_res_2)
+        # print(x.size())
+        x = self.conv_dropout(x)
+        x_res_3 = self.enc_block_3(x)
+        # print(x.size())
+        x = self.down_3(x_res_3)
+        x = self.conv_dropout(x)
+        # print(x.size())
+        x = self.bottleneck(x)
+        x = self.conv_dropout(x)
+        # print(x.size())
+        x = self.down_4(x)
+        x = torch.flatten(x, 1)
+        x = self.fc_dropout(x)
+        x = self.fc_activation(self.instancenorm(self.fc1(x)))
+        x = self.fc_dropout(x)
+        x = self.fc2(x)
+        x = torch.sigmoid(x)
+        return x
+
+
+
+
+
+if __name__ == "__main__":
+
+    network = MedNeXt(
+            in_channels = 1, 
+            n_channels = 32,
+            n_classes = 13,
+            exp_r=[2,3,4,4,4,4,4,3,2],         # Expansion ratio as in Swin Transformers
+            # exp_r = 2,
+            kernel_size=3,                     # Can test kernel_size
+            deep_supervision=True,             # Can be used to test deep supervision
+            do_res=True,                      # Can be used to individually test residual connection
+            do_res_up_down = True,
+            # block_counts = [2,2,2,2,2,2,2,2,2],
+            block_counts = [3,4,8,8,8,8,8,4,3],
+            checkpoint_style = None,
+            dim = '2d',
+            grn=True
+            
+        ).cuda()
+    
+    # network = MedNeXt_RegularUpDown(
+    #         in_channels = 1, 
+    #         n_channels = 32,
+    #         n_classes = 13, 
+    #         exp_r=[2,3,4,4,4,4,4,3,2],         # Expansion ratio as in Swin Transformers
+    #         kernel_size=3,                     # Can test kernel_size
+    #         deep_supervision=True,             # Can be used to test deep supervision
+    #         do_res=True,                      # Can be used to individually test residual connection
+    #         block_counts = [2,2,2,2,2,2,2,2,2],
+    #         
+    #     ).cuda()
+
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(count_parameters(network))
+
+    from fvcore.nn import FlopCountAnalysis
+    from fvcore.nn import parameter_count_table
+
+    # model = ResTranUnet(img_size=128, in_channels=1, num_classes=14, dummy=False).cuda()
+    x = torch.zeros((1,1,64,64,64), requires_grad=False).cuda()
+    flops = FlopCountAnalysis(network, x)
+    print(flops.total())
+    
+    with torch.no_grad():
+        print(network)
+        x = torch.zeros((1, 1, 128, 128, 128)).cuda()
+        print(network(x)[0].shape)
